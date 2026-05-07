@@ -1,0 +1,19 @@
+# Build artifacts
+Build/
+*.app
+*.dmg
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# Swift
+.build/
+DerivedData/
+.swiftpm/
+Package.resolved
