@@ -246,12 +246,14 @@ struct PDFKitView: NSViewRepresentable {
         let pdf = container.pdfView
         if pdf.document?.documentURL != url {
             pdf.document = PDFDocument(url: url)
+            container.resetSlides()
             context.coordinator.bind(view: pdf, url: url)
         }
     }
 
     static func dismantleNSView(_ container: PDFContainerView, coordinator: Coordinator) {
         coordinator.saveNow()
+        container.stopKeyMonitor()
     }
 
     final class Coordinator: NSObject {
@@ -368,12 +370,67 @@ final class ReadingStore {
     }
 }
 
+// MARK: - Presentation slide layer
+
+/// Blits a pre-rendered page bitmap over the PDF view while presenting.
+///
+/// PDFKit rasterises a page progressively — a low-resolution proxy goes up first
+/// and gets refined on a background queue — which reads as the slide sharpening up
+/// after every turn. There is no API to opt out, and pre-rendering through PDFKit
+/// buys nothing: re-rendering the same page costs ~90% of the first pass, so no
+/// page-level cache exists to warm. Rendering each slide ourselves at exactly the
+/// backing resolution and swapping the finished bitmap in is the only way to make
+/// a turn land sharp in one frame.
+final class SlideView: NSView {
+    private var image: CGImage?
+    private var pageRect: CGRect = .zero
+    var fill: NSColor = .windowBackgroundColor
+
+    // Never take mouse events: scroll-to-turn and text selection belong to the
+    // PDF view underneath.
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    func show(_ image: CGImage, in rect: CGRect) {
+        self.image = image
+        self.pageRect = rect
+        isHidden = false
+        needsDisplay = true
+    }
+
+    /// Step aside and let PDFKit draw — used whenever our bitmap would be stale or
+    /// is not ready yet, so the worst case is exactly the old behaviour.
+    func stepAside() {
+        image = nil
+        isHidden = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let image, let ctx = NSGraphicsContext.current?.cgContext else { return }
+        fill.setFill()
+        bounds.fill()
+        ctx.interpolationQuality = .high
+        ctx.draw(image, in: pageRect)
+    }
+}
+
 // MARK: - Region capture (screenshot)
 
 final class PDFContainerView: NSView {
     let pdfView: PDFView
     let overlay: ScreenshotOverlayView
-    private var observer: NSObjectProtocol?
+    private var observers: [NSObjectProtocol] = []
+    private var keyMonitor: Any?
+
+    private let slide = SlideView()
+    // Slides render off a private document instance, so a background draw can
+    // never touch the one pdfView is rendering from — PDFKit is not thread safe.
+    private var slideDoc: PDFDocument?
+    private var slideCache: [Int: CGImage] = [:]
+    private var slideWork: [Int: DispatchWorkItem] = [:]
+    private var slidePixelSize: CGSize = .zero
+    private var slideGeneration = 0
+    private var switchingMode = false
+    private let slideQueue = DispatchQueue(label: "WallePDFReader.slides", qos: .userInitiated)
 
     init(pdfView: PDFView) {
         self.pdfView = pdfView
@@ -381,29 +438,252 @@ final class PDFContainerView: NSView {
         super.init(frame: .zero)
 
         pdfView.autoresizingMask = [.width, .height]
+        slide.autoresizingMask = [.width, .height]
         overlay.autoresizingMask = [.width, .height]
         overlay.pdfView = pdfView
+        slide.fill = pdfView.backgroundColor
+        slide.isHidden = true
 
         addSubview(pdfView)
+        addSubview(slide)
         addSubview(overlay)
 
-        observer = NotificationCenter.default.addObserver(
+        let center = NotificationCenter.default
+        observers.append(center.addObserver(
             forName: .captureRegion, object: nil, queue: .main
         ) { [weak self] _ in
             self?.overlay.activate()
+        })
+
+        for name in [NSWindow.didEnterFullScreenNotification,
+                     NSWindow.didExitFullScreenNotification] {
+            observers.append(center.addObserver(
+                forName: name, object: nil, queue: .main
+            ) { [weak self] note in
+                guard let self, let win = note.object as? NSWindow, win === self.window else { return }
+                self.syncPresentationMode()
+            })
+        }
+
+        for name: Notification.Name in [.PDFViewPageChanged, .PDFViewScaleChanged] {
+            observers.append(center.addObserver(
+                forName: name, object: pdfView, queue: .main
+            ) { [weak self] _ in
+                self?.updateSlide()
+            })
         }
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
     deinit {
-        if let observer { NotificationCenter.default.removeObserver(observer) }
+        for observer in observers { NotificationCenter.default.removeObserver(observer) }
+        if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
+    }
+
+    // Also catches switching tabs while already fullscreen — a fresh container
+    // starts in the default mode and has to be brought in line.
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        syncPresentationMode()
+        if window != nil { startKeyMonitor() }
     }
 
     override func layout() {
         super.layout()
         pdfView.frame = bounds
+        slide.frame = bounds
         overlay.frame = bounds
+        // A resize changes the render size out from under every cached bitmap.
+        updateSlide()
+    }
+
+    /// Fullscreen is presentation mode: exactly one page on screen, scaled to
+    /// fit whole, with no bleed from the neighbouring pages.
+    private func syncPresentationMode() {
+        let fullScreen = window?.styleMask.contains(.fullScreen) ?? false
+        let mode: PDFDisplayMode = fullScreen ? .singlePage : .singlePageContinuous
+        guard pdfView.displayMode != mode else { return }
+
+        let page = pdfView.currentPage
+        // setDisplayMode lays out synchronously and posts PDFViewScaleChanged from
+        // inside, so hold off slide work until the geometry below has settled —
+        // otherwise it renders a bitmap sized for the layout we are leaving.
+        switchingMode = true
+        pdfView.displayMode = mode
+        // Re-fit: .singlePage fits the whole page, continuous fits width — but
+        // autoScales only recomputes the factor when it is (re)assigned.
+        pdfView.autoScales = false
+        pdfView.autoScales = true
+        if let page { pdfView.go(to: page) }
+        switchingMode = false
+
+        updateSlide()
+    }
+
+    // MARK: Slides
+
+    /// Called whenever the page, the scale or the view size changes. Puts the
+    /// matching bitmap up if we have one, otherwise steps aside and renders it.
+    private func updateSlide() {
+        guard !switchingMode,
+              pdfView.displayMode == .singlePage,
+              let doc = pdfView.document,
+              let page = pdfView.currentPage
+        else { slide.stepAside(); return }
+
+        let index = doc.index(for: page)
+        let rect = pdfView.convert(page.bounds(for: pdfView.displayBox), from: page)
+        let backing = window?.backingScaleFactor ?? 2
+        let pixel = CGSize(width: (rect.width * backing).rounded(),
+                           height: (rect.height * backing).rounded())
+        guard pixel.width > 1, pixel.height > 1 else { slide.stepAside(); return }
+
+        // Geometry moved — every cached bitmap is now the wrong size. Bumping the
+        // generation also makes in-flight renders land as no-ops.
+        if pixel != slidePixelSize {
+            slideCache.removeAll()
+            // Cancelled work that has not started yet is skipped by Dispatch, so a
+            // multi-second page is never rendered at a size nobody wants any more.
+            for work in slideWork.values { work.cancel() }
+            slideWork.removeAll()
+            slidePixelSize = pixel
+            slideGeneration += 1
+        }
+
+        if let image = slideCache[index] {
+            slide.show(image, in: rect)
+        } else {
+            slide.stepAside()
+        }
+
+        // Weighted forwards: presentations run forwards, and a heavy page needs
+        // several turns of lead time — some take seconds to rasterise. Holding 3
+        // ahead and 1 back keeps the same 5-bitmap ceiling as a symmetric window
+        // while doubling that lead. Nearest first, so the page most likely to be
+        // needed next is not queued behind a slow one.
+        slideCache = slideCache.filter { (-1...3).contains($0.key - index) }
+        for target in [index, index + 1, index + 2, index + 3, index - 1] {
+            renderSlide(target, pixel: pixel)
+        }
+    }
+
+    private func renderSlide(_ index: Int, pixel: CGSize) {
+        // slideWork deduplicates: a render in flight is not in the cache yet, so
+        // without it every updateSlide re-enqueues the same page. Heavy pages take
+        // seconds — duplicates pile up on the serial queue and starve the pages
+        // actually being turned to, which is when the fallback blur comes back.
+        guard slideCache[index] == nil, slideWork[index] == nil,
+              let doc = slideDocument(),
+              index >= 0, index < doc.pageCount,
+              let page = doc.page(at: index)
+        else { return }
+
+        let generation = slideGeneration
+        let box = pdfView.displayBox
+        let work = DispatchWorkItem {
+            let image = autoreleasepool { Self.rasterize(page, pixel: pixel, box: box) }
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.slideWork[index] = nil
+                guard let image, generation == self.slideGeneration else { return }
+                self.slideCache[index] = image
+                // Landed on the page we are looking at — put it up now.
+                if let current = self.pdfView.currentPage,
+                   self.pdfView.document?.index(for: current) == index,
+                   self.pdfView.displayMode == .singlePage {
+                    self.slide.show(image, in: self.pdfView.convert(current.bounds(for: box), from: current))
+                }
+            }
+        }
+        slideWork[index] = work
+        slideQueue.async(execute: work)
+    }
+
+    private func slideDocument() -> PDFDocument? {
+        if let slideDoc, slideDoc.documentURL == pdfView.document?.documentURL { return slideDoc }
+        slideDoc = pdfView.document?.documentURL.flatMap { PDFDocument(url: $0) }
+        return slideDoc
+    }
+
+    /// Drops every cached bitmap — call when the document behind the view changes.
+    func resetSlides() {
+        slideDoc = nil
+        slideCache.removeAll()
+        for work in slideWork.values { work.cancel() }
+        slideWork.removeAll()
+        slidePixelSize = .zero
+        slideGeneration += 1
+        slide.stepAside()
+        updateSlide()
+    }
+
+    private static func rasterize(_ page: PDFPage, pixel: CGSize, box: PDFDisplayBox) -> CGImage? {
+        let bounds = page.bounds(for: box)
+        guard bounds.width > 0, bounds.height > 0,
+              let ctx = CGContext(
+                data: nil, width: Int(pixel.width), height: Int(pixel.height),
+                bitsPerComponent: 8, bytesPerRow: 0,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue)
+        else { return nil }
+
+        ctx.setFillColor(NSColor.white.cgColor)
+        ctx.fill(CGRect(origin: .zero, size: pixel))
+        ctx.scaleBy(x: pixel.width / bounds.width, y: pixel.height / bounds.height)
+        ctx.translateBy(x: -bounds.minX, y: -bounds.minY)
+        page.draw(with: box, to: ctx)
+        return ctx.makeImage()
+    }
+
+    // MARK: Keyboard
+
+    // A local monitor rather than keyDown overrides: SwiftUI's hosting view keeps
+    // first responder to itself, so neither the PDF view nor the capture overlay
+    // ever sees a key event.
+    private func startKeyMonitor() {
+        guard keyMonitor == nil else { return }
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, event.window === self.window else { return event }
+            return self.handleKey(event) ? nil : event
+        }
+    }
+
+    func stopKeyMonitor() {
+        if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
+        keyMonitor = nil
+    }
+
+    private func handleKey(_ event: NSEvent) -> Bool {
+        // Leave menu shortcuts and anything modified to the rest of the app.
+        guard event.modifierFlags.intersection([.command, .control, .option]).isEmpty else {
+            return false
+        }
+
+        // Region capture owns the keyboard for as long as it is up.
+        if overlay.isCapturing {
+            switch event.keyCode {
+            case 53:     overlay.deactivate()          // ESC
+            case 36, 76: overlay.confirmSelection()    // Return / Enter
+            default:     return false
+            }
+            return true
+        }
+
+        // Paging keys are presentation-only; windowed reading is untouched.
+        guard pdfView.displayMode == .singlePage else { return false }
+
+        switch event.keyCode {
+        case 124, 125, 121, 49, 36:  // → ↓ PageDown Space Return
+            if pdfView.canGoToNextPage { pdfView.goToNextPage(nil) }
+        case 123, 126, 116, 51:      // ← ↑ PageUp Delete
+            if pdfView.canGoToPreviousPage { pdfView.goToPreviousPage(nil) }
+        case 115: pdfView.goToFirstPage(nil)   // Home
+        case 119: pdfView.goToLastPage(nil)    // End
+        case 53:  window?.toggleFullScreen(nil)  // ESC leaves the presentation
+        default:  return false
+        }
+        return true
     }
 }
 
@@ -417,6 +697,10 @@ final class ScreenshotOverlayView: NSView {
     private var toolbar: ScreenshotToolbarView?
     private var hint: NSView?
     private var cursorPushed = false
+
+    /// True while region capture owns the keyboard — presentation keys must
+    /// stand down so ESC/Return still mean cancel/copy.
+    var isCapturing: Bool { isActive }
 
     override var acceptsFirstResponder: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { isActive }
@@ -502,16 +786,10 @@ final class ScreenshotOverlayView: NSView {
         }
     }
 
-    override func keyDown(with event: NSEvent) {
-        guard isActive else { super.keyDown(with: event); return }
-        switch event.keyCode {
-        case 53: // ESC
-            deactivate()
-        case 36, 76: // Return / Enter
-            if selectionFrozen { copyAndExit() }
-        default:
-            super.keyDown(with: event)
-        }
+    /// Copy the frozen selection and leave capture mode. Driven by the
+    /// container's key monitor — see `PDFContainerView.handleKey`.
+    func confirmSelection() {
+        if selectionFrozen { copyAndExit() }
     }
 
     // Block scroll while active — selection rect is anchored in view coords,
