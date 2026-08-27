@@ -61,6 +61,8 @@ func pickPDF() -> URL? {
 struct PDFTab: Identifiable, Hashable {
     let id = UUID()
     let url: URL
+    // Bumped when the same file is opened again, forcing a reload from disk.
+    var generation = 0
 }
 
 final class TabsModel: ObservableObject {
@@ -70,8 +72,9 @@ final class TabsModel: ObservableObject {
     var selectedTab: PDFTab? { tabs.first { $0.id == selectedID } }
 
     func open(_ url: URL) {
-        if let existing = tabs.first(where: { $0.url == url }) {
-            selectedID = existing.id
+        if let idx = tabs.firstIndex(where: { $0.url == url }) {
+            tabs[idx].generation += 1
+            selectedID = tabs[idx].id
             return
         }
         let tab = PDFTab(url: url)
@@ -99,7 +102,7 @@ struct ContentView: View {
             }
 
             if let tab = model.selectedTab {
-                PDFKitView(url: tab.url)
+                PDFKitView(url: tab.url, generation: tab.generation)
                     .id(tab.id)
             } else {
                 DropZone { if let url = pickPDF() { model.open(url) } }
@@ -226,6 +229,7 @@ struct DropZone: View {
 
 struct PDFKitView: NSViewRepresentable {
     let url: URL
+    let generation: Int
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -238,15 +242,18 @@ struct PDFKitView: NSViewRepresentable {
         pdf.document = PDFDocument(url: url)
 
         let container = PDFContainerView(pdfView: pdf)
+        context.coordinator.generation = generation
         context.coordinator.bind(view: pdf, url: url)
         return container
     }
 
     func updateNSView(_ container: PDFContainerView, context: Context) {
         let pdf = container.pdfView
-        if pdf.document?.documentURL != url {
+        if pdf.document?.documentURL != url || context.coordinator.generation != generation {
+            context.coordinator.saveNow()
             pdf.document = PDFDocument(url: url)
             container.resetSlides()
+            context.coordinator.generation = generation
             context.coordinator.bind(view: pdf, url: url)
         }
     }
@@ -258,6 +265,7 @@ struct PDFKitView: NSViewRepresentable {
 
     final class Coordinator: NSObject {
         weak var pdfView: PDFView?
+        var generation = 0
         private var url: URL?
         private var observers: [NSObjectProtocol] = []
         private var saveItem: DispatchWorkItem?
