@@ -22,7 +22,134 @@ enum MarkdownRenderer {
     }
 
     static func body(for markdown: String) -> String {
-        let source = preprocess(stripFrontMatter(markdown))
+        let (text, notes) = extractFootnotes(stripFrontMatter(markdown))
+        var html = render(text)
+        if !notes.isEmpty {
+            html += "<section class=\"footnotes\">\n<hr>\n<ol>\n"
+            for (n, note) in notes.enumerated() {
+                var item = render(note.content)
+                let back = note.referenced
+                    ? " <a class=\"footnote-back\" href=\"#fnref-\(n + 1)\">↩</a>" : ""
+                if item.hasSuffix("</p>\n") {
+                    item.insert(contentsOf: back, at: item.index(item.endIndex, offsetBy: -5))
+                } else {
+                    item += back
+                }
+                html += "<li id=\"fn-\(n + 1)\">\(item)</li>\n"
+            }
+            html += "</ol>\n</section>\n"
+        }
+        return html
+    }
+
+    /// Foundation's parser has no footnote syntax, and worse, reads a
+    /// `[^1]: text` line as a link reference definition whenever the text has
+    /// no spaces — common in Chinese — so the note silently disappears. Pull
+    /// definitions out first and turn references into numbered superscripts,
+    /// numbered by first reference like GitHub.
+    private static func extractFootnotes(_ text: String) -> (String, [(content: String, referenced: Bool)]) {
+        var body: [String] = []
+        var definitions: [(label: String, lines: [String])] = []
+        var fence: String?
+        var inDefinition = false
+
+        for line in text.components(separatedBy: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if let f = fence {
+                if trimmed.hasPrefix(f) { fence = nil }
+                body.append(line)
+                continue
+            }
+            if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") {
+                fence = String(trimmed.prefix(3))
+                inDefinition = false
+                body.append(line)
+                continue
+            }
+
+            let ns = line as NSString
+            if let m = footnoteDefinition.firstMatch(in: line, range: NSRange(location: 0, length: ns.length)) {
+                definitions.append((ns.substring(with: m.range(at: 1)),
+                                    [ns.substring(from: m.range.location + m.range.length)]))
+                inDefinition = true
+                continue
+            }
+            // Indented lines (and the blank lines between them) continue a note.
+            if inDefinition {
+                if line.hasPrefix("    ") || line.hasPrefix("\t") {
+                    definitions[definitions.count - 1].lines.append(
+                        line.hasPrefix("\t") ? String(line.dropFirst()) : String(line.dropFirst(4)))
+                    continue
+                }
+                if trimmed.isEmpty {
+                    definitions[definitions.count - 1].lines.append("")
+                    continue
+                }
+                inDefinition = false
+            }
+            body.append(line)
+        }
+        guard !definitions.isEmpty else { return (text, []) }
+
+        var contentByLabel: [String: String] = [:]
+        for d in definitions where contentByLabel[d.label] == nil {
+            contentByLabel[d.label] = d.lines.joined(separator: "\n")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        var order: [String] = []
+        var number: [String: Int] = [:]
+        fence = nil
+        for i in body.indices {
+            let trimmed = body[i].trimmingCharacters(in: .whitespaces)
+            if let f = fence {
+                if trimmed.hasPrefix(f) { fence = nil }
+                continue
+            }
+            if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") {
+                fence = String(trimmed.prefix(3))
+                continue
+            }
+            guard body[i].contains("[^") else { continue }
+
+            let ns = body[i] as NSString
+            var result = ""
+            var cursor = 0
+            for m in footnoteReference.matches(in: body[i], range: NSRange(location: 0, length: ns.length)) {
+                let label = ns.substring(with: m.range(at: 1))
+                guard contentByLabel[label] != nil else { continue }
+                result += ns.substring(with: NSRange(location: cursor, length: m.range.location - cursor))
+                let n: Int
+                if let existing = number[label] {
+                    n = existing
+                    result += "<sup class=\"footnote-ref\"><a href=\"#fn-\(n)\">\(n)</a></sup>"
+                } else {
+                    order.append(label)
+                    n = order.count
+                    number[label] = n
+                    result += "<sup class=\"footnote-ref\" id=\"fnref-\(n)\"><a href=\"#fn-\(n)\">\(n)</a></sup>"
+                }
+                cursor = m.range.location + m.range.length
+            }
+            result += ns.substring(from: cursor)
+            body[i] = result
+        }
+
+        // Notes nobody references still get shown, after the referenced ones.
+        let referenced = order.count
+        for d in definitions where number[d.label] == nil {
+            order.append(d.label)
+            number[d.label] = order.count
+        }
+        let notes = order.enumerated().map { (contentByLabel[$0.element]!, $0.offset < referenced) }
+        return (body.joined(separator: "\n"), notes)
+    }
+
+    private static let footnoteDefinition = try! NSRegularExpression(pattern: #"^ {0,3}\[\^([^\]\s]+)\]:[ \t]?"#)
+    private static let footnoteReference = try! NSRegularExpression(pattern: #"\[\^([^\]\s]+)\]"#)
+
+    private static func render(_ markdown: String) -> String {
+        let source = preprocess(markdown)
         let options = AttributedString.MarkdownParsingOptions(
             interpretedSyntax: .full,
             failurePolicy: .returnPartiallyParsedIfPossible
@@ -267,6 +394,14 @@ enum MarkdownRenderer {
     th { font-weight: 600; }
     tr:nth-child(2n) td { background: var(--row-alt); }
     img { max-width: 100%; }
+    sup.footnote-ref { font-size: .75em; line-height: 0; }
+    sup.footnote-ref a::before { content: "["; } sup.footnote-ref a::after { content: "]"; }
+    .footnotes { margin-top: 40px; font-size: .875em; color: var(--muted); }
+    .footnotes hr { height: 1px; margin: 0 0 16px; }
+    .footnotes ol { padding-left: 1.5em; }
+    .footnotes li > p { margin: 0 0 8px; }
+    .footnote-back { margin-left: .2em; }
+    :target { scroll-margin-top: 24px; }
     kbd {
       padding: 2px 5px; font: 11px ui-monospace, Menlo, monospace;
       border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 6px;
