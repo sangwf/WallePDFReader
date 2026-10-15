@@ -25,7 +25,7 @@ struct WallePDFReaderApp: App {
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("Open…") {
-                    if let url = pickPDF() { model.open(url) }
+                    if let url = pickDocument() { model.open(url) }
                 }
                 .keyboardShortcut("o")
 
@@ -41,7 +41,7 @@ struct WallePDFReaderApp: App {
                     NotificationCenter.default.post(name: .captureRegion, object: nil)
                 }
                 .keyboardShortcut("s", modifiers: [.command, .shift])
-                .disabled(model.selectedID == nil)
+                .disabled(model.selectedTab?.kind != .pdf)
             }
         }
     }
@@ -51,11 +51,28 @@ extension Notification.Name {
     static let captureRegion = Notification.Name("WallePDFReader.captureRegion")
 }
 
-func pickPDF() -> URL? {
+func pickDocument() -> URL? {
     let panel = NSOpenPanel()
-    panel.allowedContentTypes = [.pdf]
+    panel.allowedContentTypes = DocumentKind.contentTypes
     panel.allowsMultipleSelection = false
     return panel.runModal() == .OK ? panel.url : nil
+}
+
+enum DocumentKind {
+    case pdf, markdown
+
+    static let markdownExtensions: Set<String> = ["md", "markdown", "mdown", "mkd", "mkdn"]
+
+    init?(url: URL) {
+        let ext = url.pathExtension.lowercased()
+        if ext == "pdf" { self = .pdf }
+        else if Self.markdownExtensions.contains(ext) { self = .markdown }
+        else { return nil }
+    }
+
+    static var contentTypes: [UTType] {
+        [.pdf] + markdownExtensions.sorted().compactMap { UTType(filenameExtension: $0) }
+    }
 }
 
 struct PDFTab: Identifiable, Hashable {
@@ -63,6 +80,8 @@ struct PDFTab: Identifiable, Hashable {
     let url: URL
     // Bumped when the same file is opened again, forcing a reload from disk.
     var generation = 0
+
+    var kind: DocumentKind { DocumentKind(url: url) ?? .pdf }
 }
 
 final class TabsModel: ObservableObject {
@@ -102,17 +121,23 @@ struct ContentView: View {
             }
 
             if let tab = model.selectedTab {
-                PDFKitView(url: tab.url, generation: tab.generation)
-                    .id(tab.id)
+                switch tab.kind {
+                case .pdf:
+                    PDFKitView(url: tab.url, generation: tab.generation)
+                        .id(tab.id)
+                case .markdown:
+                    MarkdownView(url: tab.url, generation: tab.generation) { model.open($0) }
+                        .id(tab.id)
+                }
             } else {
-                DropZone { if let url = pickPDF() { model.open(url) } }
+                DropZone { if let url = pickDocument() { model.open(url) } }
             }
         }
         .frame(minWidth: 700, minHeight: 700)
         .dropDestination(for: URL.self) { urls, _ in
-            let pdfs = urls.filter { $0.pathExtension.lowercased() == "pdf" }
-            for u in pdfs { model.open(u) }
-            return !pdfs.isEmpty
+            let docs = urls.filter { DocumentKind(url: $0) != nil }
+            for u in docs { model.open(u) }
+            return !docs.isEmpty
         }
     }
 }
@@ -128,14 +153,14 @@ struct TabBar: View {
                 }
 
                 Button {
-                    if let url = pickPDF() { model.open(url) }
+                    if let url = pickDocument() { model.open(url) }
                 } label: {
                     Image(systemName: "plus")
                         .font(.system(size: 12, weight: .medium))
                         .frame(width: 28, height: 24)
                 }
                 .buttonStyle(.borderless)
-                .help("Open another PDF")
+                .help("Open another document")
 
                 Spacer(minLength: 0)
             }
@@ -159,7 +184,7 @@ struct TabChip: View {
 
     var body: some View {
         HStack(spacing: 6) {
-            Image(systemName: "doc.text")
+            Image(systemName: tab.kind == .markdown ? "text.alignleft" : "doc.text")
                 .font(.caption)
                 .foregroundStyle(isSelected ? Color.accentColor : .secondary)
 
@@ -212,7 +237,7 @@ struct DropZone: View {
             Image(systemName: "doc.richtext")
                 .font(.system(size: 64, weight: .light))
                 .foregroundStyle(.secondary)
-            Text("Click to choose a PDF")
+            Text("Click to choose a PDF or Markdown file")
                 .font(.title3)
                 .foregroundStyle(.secondary)
             Text("or drop one here · ⌘O")

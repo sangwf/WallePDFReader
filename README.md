@@ -4,7 +4,7 @@
 
 # WallePDFReader
 
-最简洁的 macOS 原生 PDF 阅读器 · 多 Tab · 断点续读
+最简洁的 macOS 原生 PDF / Markdown 阅读器 · 多 Tab · 断点续读
 
 </div>
 
@@ -27,9 +27,11 @@
 - **全屏演示模式**（v1.2）— 进全屏自动切单页（整页铺满，不会露出上下页），退出全屏自动回连续滚动，当前页码保持不变。翻页：`→` `↓` `Page Down` `空格` `回车` 下一页，`←` `↑` `Page Up` `Delete` 上一页，`Home` / `End` 首末页，滚轮/触控板也能翻。`ESC` 退出演示
 - **翻页即时清晰**（v1.2）— PDFKit 单页模式下每翻一页都要先贴低分辨率代理图再后台精修，看着像分辨率慢慢变高。演示模式下改为自己按屏幕实际像素预渲染前 3 后 1 页，翻页直接换上成品位图，没有变清晰的过程
 - **区域截图**（v1.1）— `⌘⇧S` 进入截图模式，拖框选区，**双击选区直接复制**（仿微信），或者用 `[Copy] [Save…] [Cancel]` 浮窗操作；`Enter` 也是 Copy、`ESC` 取消。基于 PDF 矢量源渲染，输出永远清晰
+- **Markdown 阅读**（v1.4）— `.md` / `.markdown` 文件和 PDF 一样以 tab 打开，GitHub 风格排版并跟随系统深色模式。支持表格、任务列表、代码块、删除线、内嵌 HTML，YAML front matter 自动隐藏。相对路径的图片正常显示；点击指向其它 `.md` / `.pdf` 的链接在新 tab 打开，网页链接交给浏览器。同样记忆滚动位置
+- **重复打开即刷新**（v1.3）— 双击一个已经打开的文件，会从磁盘重新加载并保持阅读位置，适合反复导出的文档
 - **可设为系统默认 PDF 应用**（见下）
 
-底层渲染、缩放、滚动、文本选择全部交给 macOS 原生 `PDFKit`。所有功能零按钮，全部走菜单 + 快捷键，主界面始终干净。
+PDF 的渲染、缩放、滚动、文本选择全部交给 macOS 原生 `PDFKit`；Markdown 用系统自带的解析器（`AttributedString(markdown:)`）转成 HTML，再由 `WKWebView` 显示。所有功能零按钮，全部走菜单 + 快捷键，主界面始终干净。
 
 ## 设为默认 PDF 应用
 
@@ -58,7 +60,8 @@ rm Build/AppIcon.icns         # 删掉缓存
 ## 项目结构
 
 ```
-Sources/PDFReader.swift     SwiftUI App + PDFKit 整个应用（约 280 行）
+Sources/PDFReader.swift     SwiftUI App、tab 管理、PDFKit 阅读/演示/截图
+Sources/Markdown.swift      Markdown → HTML 渲染 + WKWebView 阅读视图
 Tools/MakeIcon.swift        Core Graphics 程序化生成 AppIcon
 Tools/MakeDMG.sh            一键打 DMG
 Tools/SetDefault.swift      设为系统默认 PDF 处理程序
@@ -68,4 +71,4 @@ build.sh                    编译 + 打包 .app
 
 ## 技术栈
 
-SwiftUI + PDFKit。零第三方依赖，整个 .app 不到 1 MB。
+SwiftUI + PDFKit + WebKit。零第三方依赖，整个 .app 不到 1 MB。

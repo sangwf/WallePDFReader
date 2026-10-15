@@ -20,7 +20,7 @@ cp Build/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 
 swiftc -O -parse-as-library \
     -target arm64-apple-macos13 \
-    Sources/PDFReader.swift \
+    Sources/*.swift \
     -o "$APP/Contents/MacOS/WallePDFReader"
 
 # Ad-hoc sign so Gatekeeper lets it run locally
