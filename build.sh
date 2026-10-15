@@ -26,4 +26,10 @@ swiftc -O -parse-as-library \
 # Ad-hoc sign so Gatekeeper lets it run locally
 codesign --force --sign - "$APP" >/dev/null
 
+# LaunchServices notices the bundle while it is still being assembled and
+# records it as having no executable, which drops it from Finder's Open With
+# menu. Register the finished bundle so that stale record is replaced.
+LSREG=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+"$LSREG" -f "$PWD/$APP" || true
+
 echo "Built $APP"

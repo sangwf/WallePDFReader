@@ -24,6 +24,10 @@ hdiutil create \
     -ov -format UDZO \
     "$DMG" >/dev/null
 
+# The staged copy gets registered with LaunchServices too; drop it so it does
+# not linger as a second, dead WallePDFReader.
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+    -u "$PWD/$STAGING/$APP" 2>/dev/null || true
 rm -rf "$STAGING"
 
 echo
