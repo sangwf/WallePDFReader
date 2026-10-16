@@ -294,6 +294,104 @@ enum MarkdownRenderer {
         pattern: #"\[!\[([^\]]*)\]\(\s*<?([^\s)>]+)>?(?:\s+"[^"]*")?\s*\)\]\(\s*<?([^\s)>]+)>?(?:\s+"[^"]*")?\s*\)"#
     )
 
+    /// CommonMark only lets `**` close after punctuation when whitespace or more
+    /// punctuation follows — an English assumption. Chinese puts no space after
+    /// `。`, so `**…。**后文` never closes and the asterisks show literally. Pairs
+    /// the standard rules would reject are rewritten to `<strong>` tags; the text
+    /// between them is still parsed as Markdown. Pairs that already work are
+    /// left alone.
+    private static func repairStrong(_ line: String) -> String {
+        guard line.contains("**") else { return line }
+        let chars = Array(line)
+
+        // Exact `**` runs outside code spans and escapes.
+        var delimiters: [Int] = []
+        var codeTicks = 0
+        var i = 0
+        while i < chars.count {
+            let c = chars[i]
+            if c == "\\" { i += 2; continue }
+            if c == "`" || c == "*" {
+                var n = 0
+                while i + n < chars.count, chars[i + n] == c { n += 1 }
+                if c == "`" {
+                    if codeTicks == 0 { codeTicks = n } else if codeTicks == n { codeTicks = 0 }
+                } else if codeTicks == 0, n == 2 {
+                    delimiters.append(i)
+                }
+                i += n
+                continue
+            }
+            i += 1
+        }
+
+        func isSpace(_ c: Character?) -> Bool { c.map { $0.isWhitespace } ?? true }
+        func isPunct(_ c: Character?) -> Bool { c.map { $0.isPunctuation || $0.isSymbol } ?? false }
+
+        var replacements: [Int: String] = [:]
+        var k = 0
+        while k + 1 < delimiters.count {
+            let open = delimiters[k], close = delimiters[k + 1]
+            k += 2
+            guard close > open + 2 else { continue }
+            let before = open > 0 ? chars[open - 1] : nil
+            let first = chars[open + 2]
+            let last = chars[close - 1]
+            let after = close + 2 < chars.count ? chars[close + 2] : nil
+            guard !isSpace(first), !isSpace(last) else { continue }
+
+            let opens = !isPunct(first) || isSpace(before) || isPunct(before)
+            let closes = !isPunct(last) || isSpace(after) || isPunct(after)
+            if opens && closes { continue }
+            replacements[open] = "<strong>"
+            replacements[close] = "</strong>"
+        }
+        guard !replacements.isEmpty else { return line }
+
+        var out = ""
+        i = 0
+        while i < chars.count {
+            if let tag = replacements[i] {
+                out += tag
+                i += 2
+            } else {
+                out.append(chars[i])
+                i += 1
+            }
+        }
+        return out
+    }
+
+    private static let formattedLink = try! NSRegularExpression(
+        pattern: #"(?<!!)\[([^\[\]]*[*_`~<][^\[\]]*)\]\(\s*<?([^\s)>]+)>?(?:\s+"([^"]*)")?\s*\)"#
+    )
+    private static let codeSpan = try! NSRegularExpression(pattern: #"(`+).*?\1"#)
+
+    /// Foundation's parser strips every inline style — bold, italics, code —
+    /// from link text. Links whose text carries any are rewritten to an `<a>`
+    /// tag, leaving the text between the tags to be parsed as usual.
+    private static func repairLinkText(_ line: String) -> String {
+        guard line.contains("](") else { return line }
+        let ns = line as NSString
+        let whole = NSRange(location: 0, length: ns.length)
+        let code = codeSpan.matches(in: line, range: whole).map(\.range)
+
+        var result = ""
+        var cursor = 0
+        for m in formattedLink.matches(in: line, range: whole)
+        where !code.contains(where: { NSLocationInRange(m.range.location, $0) }) {
+            result += ns.substring(with: NSRange(location: cursor, length: m.range.location - cursor))
+            let text = ns.substring(with: m.range(at: 1))
+            let href = ns.substring(with: m.range(at: 2))
+            let title = m.range(at: 3).location == NSNotFound
+                ? "" : " title=\"\(escape(ns.substring(with: m.range(at: 3))))\""
+            result += "<a href=\"\(escape(href))\"\(title)>\(text)</a>"
+            cursor = m.range.location + m.range.length
+        }
+        guard cursor > 0 else { return line }
+        return result + ns.substring(from: cursor)
+    }
+
     /// Foundation's parser drops an image nested inside a link — the usual way
     /// README badges are written — so rewrite those to inline HTML first.
     /// Fenced code is left alone so code samples are shown verbatim.
@@ -312,6 +410,7 @@ enum MarkdownRenderer {
                 out.append(line)
                 continue
             }
+            let line = repairLinkText(repairStrong(line))
             guard line.contains("[![") else { out.append(line); continue }
 
             let ns = line as NSString
